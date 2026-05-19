@@ -36,23 +36,29 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
-# Configuring embedded app metadata
+# Configuring embedded app metadata and local paths
 $Global:AppVersion = "1.0.0"
 $Global:IsDebugMode = $DebugMode.IsPresent
+
+$Global:AppDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent -Path $PSCommandPath }
+if (-not $Global:AppDir) { $Global:AppDir = $env:CD }
+
+$Global:SettingsFile = Join-Path $Global:AppDir "WingetManager_Settings.json"
 
 function global:Write-DebugLog([string]$Message) {
     if ($Global:IsDebugMode) {
         $LogLine = "[DEBUG] [$(Get-Date -Format 'HH:mm:ss.fff')] $Message"
         Write-Host $LogLine -ForegroundColor Yellow
-        Add-Content -Path "$env:TEMP\WingetManager_Debug.log" -Value $LogLine -ErrorAction SilentlyContinue
+        Add-Content -Path "$Global:AppDir\WingetManager_Debug.log" -Value $LogLine -ErrorAction SilentlyContinue
     }
 }
 
 if ($Global:IsDebugMode) { Write-DebugLog "=== WINGET MANAGER STARTED IN DEBUG MODE ===" }
 
+# Define Default Settings
 $Global:LogSettings = @{
     LoggingEnabled  = $true
-    LogPath         = "$env:TEMP\WingetManager"
+    LogPath         = $Global:AppDir
     LogFileName     = "Winget_Audit.log"
     MaxLogSizeMB    = 10
     MaxLogAgeDays   = 30
@@ -66,16 +72,58 @@ $Global:WingetSettings = @{
     DisableInteractivity  = $true
 }
 
+# Load Settings from JSON File
+function global:Load-Settings {
+    if (Test-Path $Global:SettingsFile) {
+        try {
+            $Loaded = Get-Content $Global:SettingsFile -Raw | ConvertFrom-Json
+            if ($null -ne $Loaded.LogSettings) {
+                $Global:LogSettings.LoggingEnabled = [bool]$Loaded.LogSettings.LoggingEnabled
+                $Global:LogSettings.LogPath = $Loaded.LogSettings.LogPath
+                $Global:LogSettings.LogFileName = $Loaded.LogSettings.LogFileName
+                $Global:LogSettings.MaxLogSizeMB = [int]$Loaded.LogSettings.MaxLogSizeMB
+                $Global:LogSettings.MaxLogAgeDays = [int]$Loaded.LogSettings.MaxLogAgeDays
+                $Global:LogSettings.AutoPrunePolicy = $Loaded.LogSettings.AutoPrunePolicy
+            }
+            if ($null -ne $Loaded.WingetSettings) {
+                $Global:WingetSettings.Scope = $Loaded.WingetSettings.Scope
+                $Global:WingetSettings.AcceptAgreements = [bool]$Loaded.WingetSettings.AcceptAgreements
+                $Global:WingetSettings.Architecture = $Loaded.WingetSettings.Architecture
+                $Global:WingetSettings.DisableInteractivity = [bool]$Loaded.WingetSettings.DisableInteractivity
+            }
+            Write-DebugLog "Settings loaded from $Global:SettingsFile"
+        } catch {
+            Write-DebugLog "Failed to load settings: $_"
+        }
+    }
+}
+
+function global:Save-Settings {
+    $SaveData = @{
+        LogSettings = $Global:LogSettings
+        WingetSettings = $Global:WingetSettings
+    }
+    try {
+        $SaveData | ConvertTo-Json -Depth 5 | Set-Content $Global:SettingsFile
+        Write-DebugLog "Settings saved to $Global:SettingsFile"
+    } catch {
+        Write-DebugLog "Failed to save settings: $_"
+    }
+}
+
+Load-Settings
+
 $Global:InstalledApps = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $Global:AvailableUpdates = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $Global:SearchResults = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
+$Global:UpgradeQueue = New-Object System.Collections.Generic.Queue[Object]
 
 # Defining Enterprise Logging Engine
-function Initialize-EnterpriseLogger {
+function global:Initialize-EnterpriseLogger {
     if (-not $Global:LogSettings.LoggingEnabled) { return }
 
     if (-not (Test-Path $Global:LogSettings.LogPath)) {
-        New-Item -ItemType Directory -Force -Path $Global:LogSettings.LogPath | Out-Null
+        try { New-Item -ItemType Directory -Force -Path $Global:LogSettings.LogPath | Out-Null } catch {}
     }
 
     $TargetFile = Join-Path $Global:LogSettings.LogPath $Global:LogSettings.LogFileName
@@ -115,7 +163,7 @@ function global:Write-Log {
 }
 
 # Defining robust Winget Execution Wrapper (Deadlock-Free)
-function Invoke-WingetCommand {
+function global:Invoke-WingetCommand {
     param(
         [string]$Command,
         [switch]$ReturnOutput = $true
@@ -465,7 +513,7 @@ $XAML = @"
                         <TextBlock Text="Enterprise Logging Engine" FontSize="18" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,0,0,15"/>
                         <CheckBox x:Name="SetLogEnable" Content="Enable Transactional Logging" IsChecked="True" Foreground="#FFFFFF" Margin="0,0,0,10"/>
                         <TextBlock Text="Log Directory Path:" Foreground="#A0A0A0" Margin="0,0,0,5"/>
-                        <TextBox x:Name="SetLogPath" Text="`$env:TEMP\WingetManager" Margin="0,0,0,10"/>
+                        <TextBox x:Name="SetLogPath" Text="" Margin="0,0,0,10"/>
                         <TextBlock Text="Log File Name:" Foreground="#A0A0A0" Margin="0,0,0,5"/>
                         <TextBox x:Name="SetLogName" Text="Winget_Audit.log" Margin="0,0,0,10"/>
                         <Grid Margin="0,0,0,10">
@@ -591,6 +639,31 @@ $ProgBar             = $Window.FindName("ProgBar")
 
 $OverlayTitle.Text   = "Winget Manager v$($Global:AppVersion)"
 
+# Apply Settings to UI
+$SetLogEnable.IsChecked = $Global:LogSettings.LoggingEnabled
+$SetLogPath.Text = $Global:LogSettings.LogPath
+$SetLogName.Text = $Global:LogSettings.LogFileName
+$SetLogSize.Text = $Global:LogSettings.MaxLogSizeMB.ToString()
+$SetLogAge.Text = $Global:LogSettings.MaxLogAgeDays.ToString()
+
+$SetLogPrune.SelectedIndex = switch ($Global:LogSettings.AutoPrunePolicy) {
+    "Archive" { 0 }
+    "Delete" { 1 }
+    "None" { 2 }
+    default { 0 }
+}
+
+$SetScope.SelectedIndex = if ($Global:WingetSettings.Scope -eq "machine") { 0 } else { 1 }
+switch ($Global:WingetSettings.Architecture) {
+    "" { $SetArch.SelectedIndex = 0 }
+    "x64" { $SetArch.SelectedIndex = 1 }
+    "x86" { $SetArch.SelectedIndex = 2 }
+    "arm64" { $SetArch.SelectedIndex = 3 }
+}
+
+$SetAgreements.IsChecked = $Global:WingetSettings.AcceptAgreements
+$SetInteractive.IsChecked = $Global:WingetSettings.DisableInteractivity
+
 # Setting up Data Bindings
 $GridUpdates.ItemsSource = $Global:AvailableUpdates
 $GridSearch.ItemsSource = $Global:SearchResults
@@ -698,6 +771,30 @@ function global:Load-Installed {
     }.GetNewClosure()
 }
 
+# Implementing the Queue-Based Asynchronous Upgrade Process
+$Global:ProcessNextUpgrade = {
+    if ($Global:UpgradeQueue.Count -eq 0) {
+        $ProgBar.Visibility = 'Collapsed'
+        Hide-Overlay
+        Set-Status "Upgrades completed."
+        $BtnRefreshUpdates.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        return
+    }
+
+    $pkg = $Global:UpgradeQueue.Dequeue()
+    Set-Status "Upgrading $($pkg.Name)..."
+    $OverlayText.Text = "Upgrading $($pkg.Name)..."
+    
+    $Flags = Get-CommonFlags
+    $cmd = "upgrade --id `"$($pkg.Id)`" --silent $Flags"
+    
+    Start-WingetBackgroundProcess -Arguments $cmd -TimeoutSeconds 300 -Callback {
+        param($Result)
+        $ProgBar.Value++
+        & $Global:ProcessNextUpgrade
+    }.GetNewClosure()
+}.GetNewClosure()
+
 # Implementing Dashboard Logic
 $BtnRefreshUpdates.Add_Click({
     Show-Overlay "Checking for updates... (This may take a moment)"
@@ -717,29 +814,17 @@ $BtnApplyUpdates.Add_Click({
     }
 
     $Count = $Selected.Count
-    $Flags = Get-CommonFlags
-
     Show-Overlay "Applying $Count Upgrades..."
     $ProgBar.Visibility = 'Visible'
     $ProgBar.Value = 0
     $ProgBar.Maximum = $Count
 
+    $Global:UpgradeQueue.Clear()
     foreach ($pkg in $Selected) {
-        Set-Status "Upgrading $($pkg.Name)..."
-        $OverlayText.Text = "Upgrading $($pkg.Name)..."
-        [System.Windows.Forms.Application]::DoEvents()
-        
-        $cmd = "upgrade --id `"$($pkg.Id)`" --silent $Flags"
-        $res = Invoke-WingetCommand -Command $cmd
-        
-        $ProgBar.Value++
-        [System.Windows.Forms.Application]::DoEvents()
+        $Global:UpgradeQueue.Enqueue($pkg)
     }
 
-    $ProgBar.Visibility = 'Collapsed'
-    Hide-Overlay
-    Set-Status "Upgrades completed."
-    $BtnRefreshUpdates.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+    & $Global:ProcessNextUpgrade
 })
 
 # Implementing Search and Install Logic
@@ -837,23 +922,26 @@ $MenuForceReinstall.Add_Click({
     $Result = [System.Windows.MessageBox]::Show("This will force uninstall and then reinstall $($Item.Name). Proceed?", "Force Reinstall Macro", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
     if ($Result -eq 'Yes') {
         Show-Overlay "Step 1/2: Force Uninstalling $($Item.Name)..."
-        [System.Windows.Forms.Application]::DoEvents()
         
         $Flags = Get-CommonFlags
         $CmdUn = "uninstall --id `"$($Item.Id)`" --silent --force $Flags"
-        $resUn = Invoke-WingetCommand -Command $CmdUn
-        Write-Log "Force uninstall exit code: $($resUn.ExitCode)"
         
-        Show-Overlay "Step 2/2: Reinstalling $($Item.Name)..."
-        [System.Windows.Forms.Application]::DoEvents()
-        
-        $CmdIn = "install --id `"$($Item.Id)`" --exact --silent $Flags"
-        $resIn = Invoke-WingetCommand -Command $CmdIn
-        Write-Log "Reinstall exit code: $($resIn.ExitCode)"
-        
-        Hide-Overlay
-        Set-Status "Reinstall macro completed. Final Code: $($resIn.ExitCode)"
-        $BtnRefreshInstalled.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        Start-WingetBackgroundProcess -Arguments $CmdUn -TimeoutSeconds 300 -Callback {
+            param($ResUn)
+            Write-Log "Force uninstall exit code: $($ResUn.ExitCode)"
+            
+            Show-Overlay "Step 2/2: Reinstalling $($Item.Name)..."
+            
+            $CmdIn = "install --id `"$($Item.Id)`" --exact --silent $Flags"
+            
+            Start-WingetBackgroundProcess -Arguments $CmdIn -TimeoutSeconds 300 -Callback {
+                param($ResIn)
+                Write-Log "Reinstall exit code: $($ResIn.ExitCode)"
+                Hide-Overlay
+                Set-Status "Reinstall macro completed. Final Code: $($ResIn.ExitCode)"
+                $BtnRefreshInstalled.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+            }.GetNewClosure()
+        }.GetNewClosure()
     }
 })
 
@@ -884,17 +972,17 @@ $BtnRunCmd.Add_Click({
     $CmdToRun = $TxtCompiledCmd.Text.Replace("winget ", "")
     Set-Status "Running custom command..."
     $TxtCmdOutput.Text = "Executing: winget $CmdToRun`r`n----------------------------------------`r`n"
-    [System.Windows.Forms.Application]::DoEvents()
-
-    $res = Invoke-WingetCommand -Command $CmdToRun -ReturnOutput $true
-
-    $TxtCmdOutput.Text += $res.Output
-    if ($res.Error) {
-        $TxtCmdOutput.Text += "`r`n[STDERR]:`r`n" + $res.Error
-    }
-    $TxtCmdOutput.Text += "`r`n----------------------------------------`r`nExit Code: $($res.ExitCode)"
-    $TxtCmdOutput.ScrollToEnd()
-    Set-Status "Command executed."
+    
+    Start-WingetBackgroundProcess -Arguments $CmdToRun -TimeoutSeconds 600 -Callback {
+        param($Result)
+        $TxtCmdOutput.Text += $Result.Output
+        if ($Result.Error) {
+            $TxtCmdOutput.Text += "`r`n[STDERR]:`r`n" + $Result.Error
+        }
+        $TxtCmdOutput.Text += "`r`n----------------------------------------`r`nExit Code: $($Result.ExitCode)"
+        $TxtCmdOutput.ScrollToEnd()
+        Set-Status "Command executed."
+    }.GetNewClosure()
 })
 
 $BtnExportCmd.Add_Click({
@@ -918,7 +1006,7 @@ $BtnSaveSettings.Add_Click({
     $Global:LogSettings.LogFileName = $SetLogName.Text
     $Global:LogSettings.MaxLogSizeMB = [int]$SetLogSize.Text
     $Global:LogSettings.MaxLogAgeDays = [int]$SetLogAge.Text
-    $Global:LogSettings.AutoPrunePolicy = $SetLogPrune.Text
+    $Global:LogSettings.AutoPrunePolicy = $SetLogPrune.SelectedItem.Content
 
     if ($SetScope.SelectedIndex -eq 0) { $Global:WingetSettings.Scope = "machine" } else { $Global:WingetSettings.Scope = "user" }
 
@@ -932,6 +1020,7 @@ $BtnSaveSettings.Add_Click({
     $Global:WingetSettings.AcceptAgreements = $SetAgreements.IsChecked -eq $true
     $Global:WingetSettings.DisableInteractivity = $SetInteractive.IsChecked -eq $true
 
+    Save-Settings
     Initialize-EnterpriseLogger
     Write-Log "Settings updated via UI."
     Set-Status "Settings saved successfully."
@@ -955,35 +1044,3 @@ $Window.Add_Loaded({
 
 # Show Window
 [void]$Window.ShowDialog()
-# SIG # Begin signature block
-# MIIFiwYJKoZIhvcNAQcCoIIFfDCCBXgCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
-# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUV81NO66G9rLo9GGKojGx+FrO
-# QlCgggMcMIIDGDCCAgCgAwIBAgIQdTnGUb3fnrZCF1K2xTtGMjANBgkqhkiG9w0B
-# AQsFADAkMSIwIAYDVQQDDBlDSEVTSS1KRENvZGUtU2lnbmluZy0yMDI2MB4XDTI2
-# MDMwNjE0NDY0NVoXDTI3MDMwNjE0NDY0NVowJDEiMCAGA1UEAwwZQ0hFU0ktSkRD
-# b2RlLVNpZ25pbmctMjAyNjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-# AMIvE+cjfWSthiMrydvmvgrd9ucGb77R+W5jS2EfE73xAMxLBjZBbfTdh8Ig1Oj2
-# aZuTWPwXoETEdh4ocXbtyYX0WDXqnNwSzDGDLKNiMzQ2bJEgfeegSGazOCUXchya
-# x82YR81WyxGd4sIqBBC3JpFxr+O6MZHHtqUHkkHyUY1Q8phH40X6UOH+l7AIB3yC
-# zxqyEJ68RNQFh4UhD2dS4DneN0xyPlQ/VhXcMF4dONwQz7lSIIgD+iiJzXo9Ka7F
-# ZOGm1jtq7i/p3XwLuq3zMxgeHh3VcVWh2QbO2PODgIxtchRMFBkW5BtiBjV5nSs7
-# D879uPSkhTEGk2UAHDDsbKkCAwEAAaNGMEQwDgYDVR0PAQH/BAQDAgeAMBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMDMB0GA1UdDgQWBBQGI/EgF0UkEE5pOr6J/upQmqqo2jAN
-# BgkqhkiG9w0BAQsFAAOCAQEABPRv9v2ibkmhWvzlXApwWNScLZ2c6r1ErdcIYEDf
-# UHMPwiWV8ztOT9cK6NunF9VjPSb/dCxu2OU+F+HGl1utqoTtPMV+95p9ctwu12KR
-# 20/JxfmfoGu1dTYQYZZeWapbBNOwwPg3GEti2PNHMCI+QBSN3MbnfABwVFs9T2X+
-# 7tQaOdAhY1kqp8siaCoCpwcoGWlhDdO6+hCrI3Qz5oWN/hMCrL6Sm3afgDoh8xzB
-# fxnNdcwQq2+etj+JM9Gcz+C8fUnlZmKPn+wEsMS+oZqfEUt5HEzEIe8LVuuub/Ah
-# 8eTO2IA6ouL9V9TyN0aWtV2l0qoqyoY+odq6v1QPInnLfDGCAdkwggHVAgEBMDgw
-# JDEiMCAGA1UEAwwZQ0hFU0ktSkRDb2RlLVNpZ25pbmctMjAyNgIQdTnGUb3fnrZC
-# F1K2xTtGMjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
-# BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUbtZpORFHKdqhbIIiuz/zheOr3hcwDQYJ
-# KoZIhvcNAQEBBQAEggEAOy1/hhifuCIQozruy0UIAt4a0CIHv6m3VvDaFXiMpKG/
-# fGPBbW26fSOQWjXBMwHB0IouWi0sEP3gQEkKDZ/K/V8Ta/xd+Fxj6oGTuIpRXo+U
-# KsdF+NBq2g0gaqk0Oa9FReo4DHm9kwG/MCxhfSOozm9r7rKzOCyxpIqPp23PvZ8F
-# 96uuYFTpWmXwxrsOELDlBZgHeehK/SvP3a3Z7UkDkxmPd9VLqNOda4GV6yvGqKbB
-# tIj1XKnMt4aZfU6VR/Veb2KsqsDI9i04mD56poY+75GvaoBNVdxEqkDXiLk82cOu
-# lLvRLMphHNq2HPFoKX1/SM1XbLPjx5jDe2wL9HSeUQ==
-# SIG # End signature block
